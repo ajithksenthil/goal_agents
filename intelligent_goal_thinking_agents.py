@@ -5,9 +5,39 @@ from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 from dotenv import load_dotenv
+import datetime
+
 
 # Load environment variables
 load_dotenv()
+
+
+class Memory:
+    def __init__(self, capacity: int = 100):
+        self.capacity = capacity
+        self.events: List[Dict] = []
+
+    def add_event(self, event_type: str, description: str, associated_data: Dict = None):
+        if len(self.events) >= self.capacity:
+            self.events.pop(0)  # Remove oldest event if at capacity
+        
+        self.events.append({
+            "timestamp": datetime.datetime.now(),
+            "type": event_type,
+            "description": description,
+            "data": associated_data or {}
+        })
+
+    def get_recent_events(self, n: int = 5) -> List[Dict]:
+        return self.events[-n:]
+
+    def get_events_by_type(self, event_type: str) -> List[Dict]:
+        return [event for event in self.events if event["type"] == event_type]
+
+    def summarize(self) -> str:
+        # This method could use the LLM to generate a summary of the agent's memories
+        # For now, we'll just return a simple string summary
+        return f"Agent has {len(self.events)} memories. Most recent: {self.events[-1]['description'] if self.events else 'None'}"
 
 # Add the LLMHandler class
 class LLMHandler:
@@ -80,6 +110,7 @@ class Agent:
         self.mood: float = random.uniform(-0.5, 0.5)  # Initialize with a random mood
         self.llm_handler = llm_handler
         self.thought_chain: List[str] = []
+        self.memory = Memory()
 
     def add_need(self, need: Need):
         self.needs.add(need)
@@ -90,9 +121,18 @@ class Agent:
     def execute_behavior(self, behavior: 'Behavior') -> Tuple[float, Dict[Need, float]]:
         focus, needs_fulfilled = behavior.execute()
         self.update_mood(needs_fulfilled, focus)
+        
+        # Add memory of the executed behavior
+        self.memory.add_event(
+            "behavior_execution",
+            f"Executed behavior: {behavior.name}",
+            {"focus": focus, "needs_fulfilled": {n.name: v for n, v in needs_fulfilled.items()}}
+        )
+        
         return focus, needs_fulfilled
 
     def update_mood(self, needs_fulfilled: Dict[Need, float], focus: float):
+        old_mood = self.mood  # Store the old mood before updating
         total_fulfillment = sum(needs_fulfilled.values())
         mood_change = (total_fulfillment - 0.5) * 2  # Base mood change on need fulfillment
         
@@ -106,16 +146,30 @@ class Agent:
         mood_change += random.uniform(-0.1, 0.1)
         
         self.mood = max(-1, min(1, self.mood + mood_change * 0.2))  # Gradual mood change
+        
+        # Add memory of significant mood changes
+        if abs(self.mood - old_mood) > 0.3:  # Threshold for "significant" change
+            self.memory.add_event(
+                "mood_change",
+                f"Mood changed from {old_mood:.2f} to {self.mood:.2f}",
+                {"old_mood": old_mood, "new_mood": self.mood, "change": self.mood - old_mood}
+            )
 
     def think(self):
+        recent_memories = self.memory.get_recent_events(5)
+        memory_context = "\n".join([f"- {m['description']}" for m in recent_memories])
+
         prompt = PromptTemplate(
-            input_variables=["name", "personality", "mood", "needs", "behaviors"],
+            input_variables=["name", "personality", "mood", "needs", "behaviors", "memory_context"],
             template="""
             You are {name}, an agent with a {personality} personality. Your current mood is {mood:.2f} (-1 being very negative, 1 being very positive).
             Your needs are: {needs}
             Your behaviors are: {behaviors}
             
-            Based on your current state, what are you thinking? Provide a chain of thoughts about your goals, needs, and current situation.
+            Recent memories:
+            {memory_context}
+            
+            Based on your current state and recent memories, what are you thinking? Provide a chain of thoughts about your goals, needs, and current situation.
             """
         )
         
@@ -123,10 +177,10 @@ class Agent:
         behaviors_str = ", ".join([b.name for b in self.behaviors])
         
         chain = LLMChain(llm=self.llm_handler.llm, prompt=prompt)
-        thoughts = chain.run(name=self.name, personality=self.personality, mood=self.mood, needs=needs_str, behaviors=behaviors_str)
+        thoughts = chain.invoke({"name": self.name, "personality": self.personality, "mood": self.mood, "needs": needs_str, "behaviors": behaviors_str, "memory_context": memory_context})
         
-        self.thought_chain.append(thoughts.strip())
-        return thoughts
+        self.thought_chain.append(thoughts['text'].strip())
+        return thoughts['text']
 
 class Behavior:
     def __init__(self, name: str, root_goal: Goal):
@@ -202,8 +256,7 @@ def run_multi_agent_simulation(agents: List[Agent], num_days: int):
         for agent in agents:
             print(f"  Agent: {agent.name} (Personality: {agent.personality})")
             for behavior in agent.behaviors:
-                focus, needs_fulfilled = behavior.execute()
-                agent.update_mood(needs_fulfilled, focus)
+                focus, needs_fulfilled = agent.execute_behavior(behavior)
                 print(f"    Executed behavior: {behavior.name}")
                 print(f"    Overall focus: {focus:.2f}")
                 print(f"    Mood: {agent.mood:.2f}")
@@ -214,8 +267,8 @@ def run_multi_agent_simulation(agents: List[Agent], num_days: int):
                 thoughts = agent.think()
                 print(f"    Thoughts: {thoughts}")
                 
-                print("\n    Goal Hierarchy and Focus Assessment:")
-                print_goal_hierarchy(behavior.root_goal)
+                print(f"    Memory Summary: {agent.memory.summarize()}")
+                
             print()
         print("------------------------")
 
